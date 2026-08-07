@@ -3,18 +3,24 @@ import pandas as pd
 import io
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
+# Função auxiliar para formatar os valores na tela no padrão moeda BRL
+def formatar_moeda(valor):
+    return f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
 st.set_page_config(page_title="Automação Contábil", layout="centered")
-st.title("Consolidador Getnet e iFood")
+st.title("📊 Consolidador Getnet e iFood")
+st.write("Insira os relatórios originais abaixo para gerar a consolidação contábil diária.")
 
-# Componentes de Upload da Interface
-arquivo_getnet = st.file_uploader("Anexe a planilha da GETNET", type=['xlsx'])
-arquivo_ifood = st.file_uploader("Anexe a planilha do IFOOD", type=['xlsx'])
+arquivo_getnet = st.file_uploader("📂 Anexe a planilha da GETNET", type=['xlsx'])
+arquivo_ifood = st.file_uploader("📂 Anexe a planilha do IFOOD", type=['xlsx'])
 
-if st.button("Processar Dados"):
+if st.button("🚀 Processar Dados"):
     if arquivo_getnet is not None and arquivo_ifood is not None:
         try:
-            with st.spinner('Processando matriz de dados...'):
-                # O pandas lê diretamente o arquivo injetado pelo navegador
+            with st.spinner('Engrenagens girando... Processando matriz de dados! ⚙️'):
+                # ==========================================
+                # 1. PROCESSAMENTO LÓGICO (Intacto)
+                # ==========================================
                 df_cartoes = pd.read_excel(arquivo_getnet, sheet_name='CARTÕES', header=7)
                 df_cartoes = df_cartoes[df_cartoes['STATUS DA TRANSAÇÃO'] == 'Aprovada'].copy()
                 df_cartoes['DATA_VENDA'] = pd.to_datetime(df_cartoes['DATA/HORA DA VENDA'], dayfirst=True, errors='coerce').dt.date
@@ -60,7 +66,9 @@ if st.button("Processar Dados"):
                 linha_total = pd.DataFrame([{'TIPO_VENDA': 'TOTAL GERAL', 'VALOR BRUTO': resumo_geral['VALOR BRUTO'].sum(), 'VALOR TAXA': resumo_geral['VALOR TAXA'].sum()}])
                 resumo_geral = pd.concat([resumo_geral, linha_total], ignore_index=True)
 
-                # Escrita em Buffer de Memória (Exigência para Nuvem)
+                # ==========================================
+                # 2. ESCRITA DO ARQUIVO NO BUFFER (Intacto)
+                # ==========================================
                 buffer = io.BytesIO()
                 with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
                     diario_geral.to_excel(writer, sheet_name='Movimento_Diario', index=False)
@@ -93,8 +101,37 @@ if st.button("Processar Dados"):
                                 except: pass
                             worksheet.column_dimensions[column].width = (max_length + 2)
 
-                # Injeção do Botão de Download na Interface
-                st.success("Planilha processada com sucesso!")
+                # ==========================================
+                # 3. INTERFACE DE USUÁRIO: PAINEL DE TOTAIS
+                # ==========================================
+                st.success("✨ Processamento concluído com sucesso!")
+                
+                # Cálculos para o Painel Front-end
+                total_getnet = df_cartoes_limpo['VALOR BRUTO'].sum() + df_pix_limpo['VALOR BRUTO'].sum()
+                total_ifood = ifood_agrupado['VALOR BRUTO'].sum()
+                total_vouchers = df_voucher_limpo['VALOR BRUTO'].sum()
+                total_geral = total_getnet + total_ifood + total_vouchers
+                
+                st.subheader("📋 Resumo Operacional Bruto")
+                
+                # Divisão da tela em duas colunas para organização visual
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.markdown(f"💳 **Getnet (Cartões + PIX):** {formatar_moeda(total_getnet)}")
+                    st.markdown(f"🍔 **iFood:** {formatar_moeda(total_ifood)}")
+                    st.markdown(f"💰 **TOTAL GERAL:** {formatar_moeda(total_geral)}")
+                
+                with col2:
+                    st.markdown("🎟️ **Vouchers (Detalhado):**")
+                    # Agrupa e lista cada bandeira de voucher encontrada no arquivo
+                    vouchers_agrupados = df_voucher_limpo.groupby('TIPO_VENDA')['VALOR BRUTO'].sum()
+                    for bandeira, valor in vouchers_agrupados.items():
+                        st.markdown(f"- **{bandeira}:** {formatar_moeda(valor)}")
+                
+                st.markdown("---")
+                
+                # Botão de Download
                 st.download_button(
                     label="⬇️ Baixar Planilha Consolidada",
                     data=buffer.getvalue(),
@@ -103,6 +140,6 @@ if st.button("Processar Dados"):
                 )
 
         except Exception as e:
-            st.error(f"Erro na estrutura dos arquivos: {e}")
+            st.error(f"🚨 Erro na estrutura dos arquivos: {e}")
     else:
-        st.warning("Anexe os dois arquivos antes de processar.")
+        st.warning("⚠️ Anexe os dois arquivos antes de processar.")
