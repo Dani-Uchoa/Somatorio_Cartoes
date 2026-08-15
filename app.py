@@ -7,6 +7,33 @@ def formatar_moeda(valor):
     return f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
+def extrair_info_empresa(arquivo_getnet):
+    """
+    Lê o cabeçalho comercial da planilha da Getnet (Razão Social e Período)
+    varrendo as primeiras linhas de qualquer uma das abas disponíveis.
+    """
+    empresa = None
+    periodo = None
+    try:
+        xls = pd.ExcelFile(arquivo_getnet)
+        for sheet in xls.sheet_names:
+            raw = pd.read_excel(xls, sheet_name=sheet, header=None, nrows=6)
+            for r in range(raw.shape[0]):
+                for c in range(raw.shape[1]):
+                    val = raw.iat[r, c]
+                    if not isinstance(val, str):
+                        continue
+                    if empresa is None and val.strip().startswith('Razão Social:'):
+                        empresa = val.split(':', 1)[1].strip()
+                    if periodo is None and val.strip().startswith('Periodo:'):
+                        periodo = val.split(':', 1)[1].strip()
+            if empresa and periodo:
+                break
+    except Exception:
+        pass
+    return empresa, periodo
+
+
 def processar_ifood(arquivo_ifood):
     """
     Detecta automaticamente qual dos dois modelos de relatório do iFood foi anexado
@@ -49,7 +76,7 @@ def processar_ifood(arquivo_ifood):
     # ------------------------------------------------------------
     # MODELO 2: Relatório de Pedidos (novo modelo, sem data de repasse)
     # ------------------------------------------------------------
-    colunas_modelo_2 = {'STATUS FINAL DO PEDIDO', 'DATA', 'TOTAL PAGO PELO CLIENTE (R$)'}
+    colunas_modelo_2 = {'STATUS FINAL DO PEDIDO', 'DATA', 'VALOR DOS ITENS (R$)'}
     if colunas_modelo_2.issubset(colunas):
         # Considera CONCLUIDO e CANCELAMENTO PARCIAL (o valor que efetivamente ficou);
         # exclui apenas o CANCELADO total.
@@ -59,7 +86,8 @@ def processar_ifood(arquivo_ifood):
         # Este modelo de relatório não informa data de repasse/liquidação -> fica em branco
         vendas_ifood['DATA_PAGAMENTO'] = pd.NaT
 
-        vendas_ifood['VALOR BRUTO'] = pd.to_numeric(vendas_ifood['TOTAL PAGO PELO CLIENTE (R$)'], errors='coerce').fillna(0)
+        # VALOR DOS ITENS (R$) = valor de venda real (exclui taxa de entrega repassada ao entregador)
+        vendas_ifood['VALOR BRUTO'] = pd.to_numeric(vendas_ifood['VALOR DOS ITENS (R$)'], errors='coerce').fillna(0)
 
         bruto_ifood = (
             vendas_ifood
@@ -91,6 +119,11 @@ if st.button("🚀 Processar Dados"):
     if arquivo_getnet is not None and arquivo_ifood is not None:
         try:
             with st.spinner('Engrenagens girando... Processando matriz de dados! ⚙️'):
+                # ==========================================
+                # 0. IDENTIFICAÇÃO DA EMPRESA E COMPETÊNCIA
+                # ==========================================
+                empresa_nome, competencia = extrair_info_empresa(arquivo_getnet)
+
                 # ==========================================
                 # 1. PROCESSAMENTO GETNET
                 # ==========================================
@@ -147,23 +180,37 @@ if st.button("🚀 Processar Dados"):
                 # 4. ESCRITA NO BUFFER (Excel)
                 # ==========================================
                 buffer = io.BytesIO()
+                # Reserva 2 linhas no topo da aba Resumo_Totais para Empresa/Competência (+1 linha em branco)
+                linha_inicio_resumo = 3 if (empresa_nome or competencia) else 0
+
                 with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
                     diario_geral.to_excel(writer, sheet_name='Movimento_Diario', index=False)
-                    resumo_geral.to_excel(writer, sheet_name='Resumo_Totais', index=False)
+                    resumo_geral.to_excel(writer, sheet_name='Resumo_Totais', index=False, startrow=linha_inicio_resumo)
 
                     workbook = writer.book
                     header_font = Font(bold=True, color="FFFFFF")
                     header_fill = PatternFill("solid", fgColor="2F4F4F")
+                    info_font = Font(bold=True, color="2F4F4F")
                     border = Border(left=Side(style='thin', color='D3D3D3'), right=Side(style='thin', color='D3D3D3'),
                                     top=Side(style='thin', color='D3D3D3'), bottom=Side(style='thin', color='D3D3D3'))
 
+                    # Cabeçalho de identificação (Empresa / Competência) na aba Resumo_Totais
+                    if linha_inicio_resumo:
+                        ws_resumo = workbook['Resumo_Totais']
+                        ws_resumo.cell(row=1, column=1, value=f"Empresa: {empresa_nome or 'Não identificada'}").font = info_font
+                        ws_resumo.cell(row=2, column=1, value=f"Competência: {competencia or 'Não identificada'}").font = info_font
+
+                    # Linha do cabeçalho da tabela em cada aba (1-indexado)
+                    linha_cabecalho = {'Movimento_Diario': 1, 'Resumo_Totais': linha_inicio_resumo + 1}
+
                     for sheet_name in workbook.sheetnames:
                         worksheet = workbook[sheet_name]
-                        for cell in worksheet[1]:
+                        cab = linha_cabecalho.get(sheet_name, 1)
+                        for cell in worksheet[cab]:
                             cell.font = header_font
                             cell.fill = header_fill
                             cell.alignment = Alignment(horizontal="center", vertical="center")
-                        for row in worksheet.iter_rows(min_row=2, max_row=worksheet.max_row, min_col=1, max_col=worksheet.max_column):
+                        for row in worksheet.iter_rows(min_row=cab + 1, max_row=worksheet.max_row, min_col=1, max_col=worksheet.max_column):
                             for cell in row:
                                 cell.border = border
                                 if isinstance(cell.value, float):
@@ -191,6 +238,7 @@ if st.button("🚀 Processar Dados"):
                 total_geral = total_getnet + total_ifood + total_vouchers
 
                 st.subheader("📋 Resumo Operacional Bruto")
+                st.markdown(f"🏢 **Empresa:** {empresa_nome or 'Não identificada'}  \n📅 **Competência:** {competencia or 'Não identificada'}")
                 col1, col2 = st.columns(2)
                 with col1:
                     st.markdown(f"💳 **Getnet (Cartões + PIX):** {formatar_moeda(total_getnet)}")
