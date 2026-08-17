@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import io
+import numpy as np
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
 COLUNAS_PADRAO = ['DATA_VENDA', 'DATA_PAGAMENTO', 'TIPO_VENDA', 'VALOR BRUTO', 'VALOR TAXA']
@@ -11,10 +12,6 @@ def formatar_moeda(valor):
 
 
 def extrair_info_empresa(arquivo_getnet):
-    """
-    Lê o cabeçalho comercial da planilha da Getnet (Razão Social e Período)
-    varrendo as primeiras linhas de qualquer uma das abas disponíveis.
-    """
     empresa = None
     periodo = None
     try:
@@ -38,10 +35,6 @@ def extrair_info_empresa(arquivo_getnet):
 
 
 def competencia_de_datas(serie_datas):
-    """
-    Retorna a competência no formato 'MM/YYYY' com base no mês/ano mais frequente
-    de uma série de datas. Retorna None se não houver datas válidas.
-    """
     s = pd.to_datetime(serie_datas, errors='coerce').dropna()
     if s.empty:
         return None
@@ -52,10 +45,6 @@ def competencia_de_datas(serie_datas):
 
 
 def periodo_texto_para_competencia(periodo_texto):
-    """
-    Converte 'Periodo: 01/07/2026 a 31/07/2026' (já sem o prefixo) para 'MM/YYYY',
-    usando a data inicial do intervalo.
-    """
     if not periodo_texto:
         return None
     primeira_data = periodo_texto.split(' a ')[0].strip()
@@ -66,83 +55,54 @@ def periodo_texto_para_competencia(periodo_texto):
 
 
 def processar_ifood(arquivo_ifood):
-    """
-    Detecta automaticamente qual dos dois modelos de relatório do iFood foi anexado
-    e devolve (DataFrame padronizado, nome_da_loja_ou_None).
-
-    Modelo 1 - "Extrato Financeiro" (fato_gerador / descricao_lancamento / data_repasse_esperada)
-    Modelo 2 - "Relatório de Pedidos" (STATUS FINAL DO PEDIDO / VALOR DOS ITENS (R$))
-               -> este modelo NÃO possui data de repasse, então DATA_PAGAMENTO fica em branco.
-    """
     df_ifood = pd.read_excel(arquivo_ifood)
     colunas = set(df_ifood.columns)
 
-    # ------------------------------------------------------------
-    # MODELO 1: Extrato Financeiro (formato original já suportado)
-    # ------------------------------------------------------------
-    colunas_modelo_1 = {'fato_gerador', 'data_criacao_pedido_associado', 'descricao_lancamento', 'valor'}
-    if colunas_modelo_1.issubset(colunas):
-        vendas_ifood = df_ifood[df_ifood['fato_gerador'] == 'Venda'].copy()
-        vendas_ifood['DATA_VENDA'] = pd.to_datetime(vendas_ifood['data_criacao_pedido_associado'], errors='coerce').dt.date
+    # Identifica o nome exato da coluna de lançamento no Modelo 1
+    col_lancamento = None
+    for nome in ['descricao_lancamento', 'tipo_lancamento', 'Tipo de lançamento']:
+        if nome in colunas:
+            col_lancamento = nome
+            break
 
-        if 'data_repasse_esperada' in colunas:
-            vendas_ifood['DATA_PAGAMENTO'] = pd.to_datetime(vendas_ifood['data_repasse_esperada'], errors='coerce').dt.date
-        else:
-            vendas_ifood['DATA_PAGAMENTO'] = pd.NaT
-
-        vendas_ifood['valor'] = pd.to_numeric(vendas_ifood['valor'], errors='coerce').fillna(0)
-
-        bruto_ifood = (
-            vendas_ifood[vendas_ifood['descricao_lancamento'] == 'Entrada Financeira']
-            .groupby(['DATA_VENDA', 'DATA_PAGAMENTO'], dropna=False)['valor']
-            .sum()
-            .reset_index()
-        )
-        bruto_ifood.rename(columns={'valor': 'VALOR BRUTO'}, inplace=True)
+    # MODELO 1: Extrato Financeiro
+    colunas_m1 = {'fato_gerador', 'valor', 'data_criacao_pedido_associado', 'data_repasse_esperada'}
+    if colunas_m1.issubset(colunas) and col_lancamento:
+        vendas = df_ifood[df_ifood['fato_gerador'].astype(str).str.strip().str.upper() == 'VENDA'].copy()
+        vendas = vendas[vendas[col_lancamento].astype(str).str.strip().str.upper() == 'ENTRADA FINANCEIRA']
+        
+        vendas['DATA_VENDA'] = pd.to_datetime(vendas['data_criacao_pedido_associado'], errors='coerce').dt.date
+        vendas['DATA_PAGAMENTO'] = pd.to_datetime(vendas['data_repasse_esperada'], errors='coerce').dt.date
+        vendas['VALOR BRUTO'] = pd.to_numeric(vendas['valor'], errors='coerce').fillna(0)
+        
+        bruto_ifood = vendas.groupby(['DATA_VENDA', 'DATA_PAGAMENTO'], dropna=False)['VALOR BRUTO'].sum().reset_index()
         bruto_ifood['VALOR TAXA'] = 0.00
-        bruto_ifood['TIPO_VENDA'] = 'iFood'
+        bruto_ifood['TIPO_VENDA'] = 'IFOOD'
+        
         return bruto_ifood[COLUNAS_PADRAO], None
 
-    # ------------------------------------------------------------
-    # MODELO 2: Relatório de Pedidos (novo modelo, sem data de repasse)
-    # ------------------------------------------------------------
-    colunas_modelo_2 = {'STATUS FINAL DO PEDIDO', 'DATA', 'VALOR DOS ITENS (R$)'}
-    if colunas_modelo_2.issubset(colunas):
-        # Considera CONCLUIDO e CANCELAMENTO PARCIAL (o valor que efetivamente ficou);
-        # exclui apenas o CANCELADO total.
-        vendas_ifood = df_ifood[df_ifood['STATUS FINAL DO PEDIDO'] != 'CANCELADO'].copy()
-
-        vendas_ifood['DATA_VENDA'] = pd.to_datetime(vendas_ifood['DATA'], errors='coerce').dt.date
-        # Este modelo de relatório não informa data de repasse/liquidação -> fica em branco
-        vendas_ifood['DATA_PAGAMENTO'] = pd.NaT
-
-        # VALOR DOS ITENS (R$) = valor de venda real (exclui taxa de entrega repassada ao entregador)
-        vendas_ifood['VALOR BRUTO'] = pd.to_numeric(vendas_ifood['VALOR DOS ITENS (R$)'], errors='coerce').fillna(0)
-
-        bruto_ifood = (
-            vendas_ifood
-            .groupby(['DATA_VENDA', 'DATA_PAGAMENTO'], dropna=False)['VALOR BRUTO']
-            .sum()
-            .reset_index()
-        )
+    # MODELO 2: Relatório de Pedidos
+    colunas_m2 = {'DATA E HORA DO PEDIDO', 'STATUS FINAL DO PEDIDO', 'VALOR DOS ITENS (R$)'}
+    if colunas_m2.issubset(colunas):
+        vendas = df_ifood[df_ifood['STATUS FINAL DO PEDIDO'].astype(str).str.strip().str.upper().str.contains('CONCLU')].copy()
+        
+        vendas['DATA_VENDA'] = pd.to_datetime(vendas['DATA E HORA DO PEDIDO'], errors='coerce').dt.date
+        vendas['DATA_PAGAMENTO'] = pd.NaT  
+        vendas['VALOR BRUTO'] = pd.to_numeric(vendas['VALOR DOS ITENS (R$)'], errors='coerce').fillna(0)
+        
+        bruto_ifood = vendas.groupby(['DATA_VENDA', 'DATA_PAGAMENTO'], dropna=False)['VALOR BRUTO'].sum().reset_index()
         bruto_ifood['VALOR TAXA'] = 0.00
-        bruto_ifood['TIPO_VENDA'] = 'iFood'
-
+        bruto_ifood['TIPO_VENDA'] = 'IFOOD'
+        
         nome_loja = None
         if 'NOME DA LOJA' in colunas:
             modas = df_ifood['NOME DA LOJA'].dropna()
             if not modas.empty:
                 nome_loja = modas.mode().iloc[0]
-
+                
         return bruto_ifood[COLUNAS_PADRAO], nome_loja
 
-    # ------------------------------------------------------------
-    # Nenhum modelo reconhecido
-    # ------------------------------------------------------------
-    raise ValueError(
-        "Modelo de planilha do iFood não reconhecido. "
-        "Colunas encontradas não correspondem ao 'Extrato Financeiro' nem ao 'Relatório de Pedidos'."
-    )
+    raise ValueError("A planilha anexada não possui a estrutura exata do Modelo 1 ou Modelo 2 do iFood informados.")
 
 
 st.set_page_config(page_title="Automação Contábil", layout="centered")
@@ -152,6 +112,11 @@ st.write("Anexe a planilha da GETNET, do IFOOD, ou as duas (do mesmo período) p
 arquivo_getnet = st.file_uploader("📂 Anexe a planilha da GETNET (opcional)", type=['xlsx'])
 arquivo_ifood = st.file_uploader("📂 Anexe a planilha do IFOOD (opcional)", type=['xlsx'])
 
+if 'dados_processados' not in st.session_state:
+    st.session_state['dados_processados'] = False
+if 'buffer_excel' not in st.session_state:
+    st.session_state['buffer_excel'] = None
+
 if st.button("🚀 Processar Dados"):
     if arquivo_getnet is None and arquivo_ifood is None:
         st.warning("⚠️ Anexe ao menos uma planilha (Getnet e/ou iFood) para processar.")
@@ -160,9 +125,6 @@ if st.button("🚀 Processar Dados"):
             with st.spinner('Engrenagens girando... Processando matriz de dados! ⚙️'):
                 df_vazio = pd.DataFrame(columns=COLUNAS_PADRAO)
 
-                # ==========================================
-                # 1. PROCESSAMENTO GETNET (se anexado)
-                # ==========================================
                 empresa_nome_getnet = None
                 periodo_getnet_texto = None
                 competencia_getnet = None
@@ -170,7 +132,7 @@ if st.button("🚀 Processar Dados"):
                 if arquivo_getnet is not None:
                     empresa_nome_getnet, periodo_getnet_texto = extrair_info_empresa(arquivo_getnet)
 
-                    # Cartões (Modalidade e Data de Pagamento)
+                    # Cartões
                     df_cartoes = pd.read_excel(arquivo_getnet, sheet_name='CARTÕES', header=7)
                     df_cartoes = df_cartoes[df_cartoes['STATUS DA TRANSAÇÃO'] == 'Aprovada'].copy()
                     df_cartoes['DATA_VENDA'] = pd.to_datetime(df_cartoes['DATA/HORA DA VENDA'], dayfirst=True, errors='coerce').dt.date
@@ -184,7 +146,7 @@ if st.button("🚀 Processar Dados"):
                     df_pix = pd.read_excel(arquivo_getnet, sheet_name='PIX', header=7)
                     df_pix = df_pix[df_pix['STATUS'] == 'Paga'].copy()
                     df_pix['DATA_VENDA'] = pd.to_datetime(df_pix['DATA/HORA DA VENDA'], dayfirst=True, errors='coerce').dt.date
-                    df_pix['DATA_PAGAMENTO'] = df_pix['DATA_VENDA']  # Liquidação imediata
+                    df_pix['DATA_PAGAMENTO'] = df_pix['DATA_VENDA']
                     df_pix['VALOR BRUTO'] = pd.to_numeric(df_pix['VALOR DA VENDA'], errors='coerce').fillna(0)
                     df_pix['VALOR TAXA'] = pd.to_numeric(df_pix['VALOR TAXA'], errors='coerce').fillna(0)
                     df_pix['TIPO_VENDA'] = 'Getnet PIX'
@@ -200,19 +162,14 @@ if st.button("🚀 Processar Dados"):
                     df_voucher['TIPO_VENDA'] = df_voucher['BANDEIRA'].replace({'Sodexo': 'Pluxee'})
                     df_voucher_limpo = df_voucher[COLUNAS_PADRAO]
 
-                    # Agrupamento Getnet exigindo a chave DATA_PAGAMENTO
                     df_getnet_consolidado = pd.concat([df_cartoes_limpo, df_pix_limpo, df_voucher_limpo], ignore_index=True)
                     getnet_agrupado = df_getnet_consolidado.groupby(['DATA_VENDA', 'DATA_PAGAMENTO', 'TIPO_VENDA'], dropna=False)[['VALOR BRUTO', 'VALOR TAXA']].sum().reset_index()
 
-                    # Competência: prioriza o texto declarado no cabeçalho da Getnet; usa as datas como reforço/fallback
                     competencia_getnet = periodo_texto_para_competencia(periodo_getnet_texto) or competencia_de_datas(getnet_agrupado['DATA_VENDA'])
                 else:
                     df_cartoes_limpo = df_pix_limpo = df_voucher_limpo = df_vazio.copy()
                     getnet_agrupado = df_vazio.copy()
 
-                # ==========================================
-                # 2. PROCESSAMENTO IFOOD (se anexado, com detecção automática de modelo)
-                # ==========================================
                 nome_loja_ifood = None
                 competencia_ifood = None
 
@@ -222,9 +179,6 @@ if st.button("🚀 Processar Dados"):
                 else:
                     ifood_agrupado = df_vazio.copy()
 
-                # ==========================================
-                # 3. VALIDAÇÃO DE COMPETÊNCIA (só quando os 2 arquivos são anexados)
-                # ==========================================
                 if arquivo_getnet is not None and arquivo_ifood is not None:
                     if competencia_getnet and competencia_ifood and competencia_getnet != competencia_ifood:
                         st.error(
@@ -238,21 +192,29 @@ if st.button("🚀 Processar Dados"):
                 empresa_nome = empresa_nome_getnet or nome_loja_ifood
                 competencia = competencia_getnet or competencia_ifood
 
-                # ==========================================
-                # 4. CONSOLIDAÇÃO MATRICIAL GERAL
-                # ==========================================
+                # Consolidação
                 diario_geral = pd.concat([getnet_agrupado, ifood_agrupado], ignore_index=True)
                 diario_geral = diario_geral.sort_values(by=['DATA_VENDA', 'DATA_PAGAMENTO', 'TIPO_VENDA']).reset_index(drop=True)
 
+                # Regras de Negócio e Formatação para OFX Externo
+                diario_geral['TIPO_VENDA'] = diario_geral['TIPO_VENDA'].astype(str).str.upper()
+                diario_geral['VALOR TAXA'] = diario_geral['VALOR TAXA'].abs()
+                
+                # Transformação de datas
+                diario_geral['DATA_VENDA'] = diario_geral['DATA_VENDA'].apply(
+                    lambda x: x.strftime('%d/%m/%Y') if pd.notnull(x) else ''
+                )
+                diario_geral['DATA_PAGAMENTO'] = diario_geral['DATA_PAGAMENTO'].apply(
+                    lambda x: x.strftime('%d.%m.%Y') if pd.notnull(x) else ''
+                )
+
+                # Geração do Resumo
                 resumo_geral = diario_geral.groupby('TIPO_VENDA')[['VALOR BRUTO', 'VALOR TAXA']].sum().reset_index()
                 linha_total = pd.DataFrame([{'TIPO_VENDA': 'TOTAL GERAL', 'VALOR BRUTO': resumo_geral['VALOR BRUTO'].sum(), 'VALOR TAXA': resumo_geral['VALOR TAXA'].sum()}])
                 resumo_geral = pd.concat([resumo_geral, linha_total], ignore_index=True)
 
-                # ==========================================
-                # 5. ESCRITA NO BUFFER (Excel)
-                # ==========================================
+                # Escrita no Buffer
                 buffer = io.BytesIO()
-                # Reserva 2 linhas no topo da aba Resumo_Totais para Empresa/Competência
                 linha_inicio_resumo = 3 if (empresa_nome or competencia) else 0
 
                 with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
@@ -266,13 +228,11 @@ if st.button("🚀 Processar Dados"):
                     border = Border(left=Side(style='thin', color='D3D3D3'), right=Side(style='thin', color='D3D3D3'),
                                     top=Side(style='thin', color='D3D3D3'), bottom=Side(style='thin', color='D3D3D3'))
 
-                    # Cabeçalho de identificação (Empresa / Competência) na aba Resumo_Totais
                     if linha_inicio_resumo:
                         ws_resumo = workbook['Resumo_Totais']
                         ws_resumo.cell(row=1, column=1, value=f"Empresa: {empresa_nome or 'Não identificada'}").font = info_font
                         ws_resumo.cell(row=2, column=1, value=f"Competência: {competencia or 'Não identificada'}").font = info_font
 
-                    # Linha do cabeçalho da tabela em cada aba (1-indexado)
                     linha_cabecalho = {'Movimento_Diario': 1, 'Resumo_Totais': linha_inicio_resumo + 1}
 
                     for sheet_name in workbook.sheetnames:
@@ -285,10 +245,8 @@ if st.button("🚀 Processar Dados"):
                         for row in worksheet.iter_rows(min_row=cab + 1, max_row=worksheet.max_row, min_col=1, max_col=worksheet.max_column):
                             for cell in row:
                                 cell.border = border
-                                if isinstance(cell.value, float):
+                                if isinstance(cell.value, float) or isinstance(cell.value, int):
                                     cell.number_format = '#,##0.00'
-                                elif isinstance(cell.value, pd.Timestamp) or type(cell.value).__name__ == 'date':
-                                    cell.number_format = 'DD/MM/YYYY'  # Força formatação visual para as datas
                         for col in worksheet.columns:
                             max_length = 0
                             column = col[0].column_letter
@@ -299,43 +257,54 @@ if st.button("🚀 Processar Dados"):
                                 except: pass
                             worksheet.column_dimensions[column].width = (max_length + 2)
 
-                # ==========================================
-                # 6. INTERFACE DE USUÁRIO
-                # ==========================================
-                st.success("✨ Processamento concluído com sucesso!")
-
-                total_getnet = df_cartoes_limpo['VALOR BRUTO'].sum() + df_pix_limpo['VALOR BRUTO'].sum()
-                total_ifood = ifood_agrupado['VALOR BRUTO'].sum()
-                total_vouchers = df_voucher_limpo['VALOR BRUTO'].sum()
-                total_geral = total_getnet + total_ifood + total_vouchers
-
-                st.subheader("📋 Resumo Operacional Bruto")
-                st.markdown(f"🏢 **Empresa:** {empresa_nome or 'Não identificada'}  \n📅 **Competência:** {competencia or 'Não identificada'}")
-                col1, col2 = st.columns(2)
-                with col1:
-                    if arquivo_getnet is not None:
-                        st.markdown(f"💳 **Getnet (Cartões + PIX):** {formatar_moeda(total_getnet)}")
-                    if arquivo_ifood is not None:
-                        st.markdown(f"🍔 **iFood:** {formatar_moeda(total_ifood)}")
-                    st.markdown(f"💰 **TOTAL GERAL:** {formatar_moeda(total_geral)}")
-                with col2:
-                    if arquivo_getnet is not None and not df_voucher_limpo.empty:
-                        st.markdown("🎟️ **Vouchers (Detalhado):**")
-                        vouchers_agrupados = df_voucher_limpo.groupby('TIPO_VENDA')['VALOR BRUTO'].sum()
-                        for bandeira, valor in vouchers_agrupados.items():
-                            st.markdown(f"- **{bandeira}:** {formatar_moeda(valor)}")
-
-                if arquivo_ifood is not None and ifood_agrupado['DATA_PAGAMENTO'].isna().all():
-                    st.caption("ℹ️ O modelo de planilha do iFood anexado não informa data de repasse/liquidação — a coluna DATA_PAGAMENTO ficou em branco para essas linhas.")
-
-                st.markdown("---")
-
-                st.download_button(
-                    label="⬇️ Baixar Planilha Consolidada",
-                    data=buffer.getvalue(),
-                    file_name="Consolidado_Contabilidade.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
+                # Persistência no Session State
+                st.session_state['buffer_excel'] = buffer.getvalue()
+                st.session_state['resumo_dados'] = {
+                    'empresa': empresa_nome or 'Não identificada',
+                    'competencia': competencia or 'Não identificada',
+                    'total_getnet': df_cartoes_limpo['VALOR BRUTO'].sum() + df_pix_limpo['VALOR BRUTO'].sum() if arquivo_getnet else 0,
+                    'total_ifood': ifood_agrupado['VALOR BRUTO'].sum() if arquivo_ifood else 0,
+                    'total_vouchers': df_voucher_limpo['VALOR BRUTO'].sum() if arquivo_getnet else 0,
+                    'arquivo_getnet': arquivo_getnet is not None,
+                    'arquivo_ifood': arquivo_ifood is not None,
+                    'ifood_sem_data': arquivo_ifood is not None and ifood_agrupado['DATA_PAGAMENTO'].isna().all(),
+                    'vouchers_agrupados': df_voucher_limpo.groupby('TIPO_VENDA')['VALOR BRUTO'].sum() if arquivo_getnet else None
+                }
+                st.session_state['dados_processados'] = True
 
         except Exception as e:
             st.error(f"🚨 Erro na estrutura dos arquivos: {e}")
+
+if st.session_state.get('dados_processados'):
+    resumo = st.session_state['resumo_dados']
+    total_geral = resumo['total_getnet'] + resumo['total_ifood'] + resumo['total_vouchers']
+    
+    st.success("✨ Processamento concluído com sucesso!")
+    st.subheader("📋 Resumo Operacional Bruto")
+    st.markdown(f"🏢 **Empresa:** {resumo['empresa']}  \n📅 **Competência:** {resumo['competencia']}")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        if resumo['arquivo_getnet']:
+            st.markdown(f"💳 **Getnet (Cartões + PIX):** {formatar_moeda(resumo['total_getnet'])}")
+        if resumo['arquivo_ifood']:
+            st.markdown(f"🍔 **iFood:** {formatar_moeda(resumo['total_ifood'])}")
+        st.markdown(f"💰 **TOTAL GERAL:** {formatar_moeda(total_geral)}")
+    
+    with col2:
+        if resumo['arquivo_getnet'] and resumo['vouchers_agrupados'] is not None and not resumo['vouchers_agrupados'].empty:
+            st.markdown("🎟️ **Vouchers (Detalhado):**")
+            for bandeira, valor in resumo['vouchers_agrupados'].items():
+                st.markdown(f"- **{bandeira}:** {formatar_moeda(valor)}")
+                
+    if resumo['ifood_sem_data']:
+        st.caption("ℹ️ O modelo de planilha do iFood anexado não informa data de repasse/liquidação — a coluna DATA_PAGAMENTO ficou em branco para essas linhas.")
+
+    st.markdown("---")
+
+    st.download_button(
+        label="⬇️ Baixar Planilha Consolidada",
+        data=st.session_state['buffer_excel'],
+        file_name="Consolidado_Contabilidade.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
